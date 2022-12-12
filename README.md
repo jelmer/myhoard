@@ -806,6 +806,14 @@ And have all test run, or just
 Setting `PYTHON_VERSION` is optional, but make sure you're using the same interpreter that was employed during setup, otherwise
 you may encounter runtime errors.
 
+# System Installation
+
+myhoard can be installed system-wide by running:
+
+`python3 setup.py install`
+
+A .spec file is also present in this directory for building RPM files.
+
 # License
 
 MyHoard is licensed under the Apache License, Version 2.0. Full license text
