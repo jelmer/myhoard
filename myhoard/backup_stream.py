@@ -1,6 +1,7 @@
 # Copyright (c) 2019 Aiven, Helsinki, Finland. https://aiven.io/
 from .append_only_state_manager import AppendOnlyStateManager
 from .basebackup_operation import BasebackupOperation
+from .binlog_scanner import BinlogInfo
 from .errors import XtraBackupError
 from .state_manager import StateManager
 from .util import (
@@ -9,6 +10,8 @@ from .util import (
     DEFAULT_MYSQL_TIMEOUT,
     ERR_TIMEOUT,
     first_contains_gtids_not_in_second,
+    GtidExecuted,
+    GtidRangeDict,
     make_fs_metadata,
     mysql_cursor,
     parse_fs_metadata,
@@ -25,10 +28,12 @@ from httplib2 import ServerNotFoundError
 from rohmu import errors as rohmu_errors
 from rohmu.compressor import CompressionStream
 from rohmu.encryptor import EncryptorStream
+from rohmu.object_storage.base import BaseTransfer
 from rohmu.object_storage.s3 import S3Transfer
 from socket import gaierror
 from socks import GeneralProxyError, ProxyConnectionError
 from ssl import SSLEOFError
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypedDict
 
 import contextlib
 import enum
@@ -41,6 +46,16 @@ import time
 import uuid
 
 BINLOG_BUCKET_SIZE = 500
+
+
+class RemoteBinlogInfo(TypedDict):
+    remote_index: int
+    gtid_ranges: List[GtidRangeDict]
+
+
+class Compression(TypedDict):
+    algorithm: Optional[str]
+    level: int
 
 
 class BackupStream(threading.Thread):
@@ -84,47 +99,78 @@ class BackupStream(threading.Thread):
         requested = "requested"
         scheduled = "scheduled"
 
+    class State(TypedDict):
+        active_details: Dict
+        backup_errors: int
+        basebackup_errors: int
+        basebackup_file_metadata: Optional[Dict]
+        basebackup_info: Dict
+        closed_info: Dict
+        completed_info: Dict
+        backup_reason: "BackupStream.BackupReason"
+        created_at: float
+        immediate_scan_required: bool
+        initial_latest_complete_binlog_index: Optional[int]
+        last_binlog_upload_time: int
+        last_processed_local_index: Optional[int]
+        last_remote_state_check: int
+        # Map of local index to remote key entries for binary logs we have not yet uploaded. Can be used to
+        # perform server side copy of the file instead of local upload
+        local_index_to_remote_key: Dict[int, str]
+        mode: "BackupStream.Mode"
+        next_index: int
+        normalized_backup_time: float
+        pending_binlogs: List[BinlogInfo]
+        prepare_details: Dict
+        # Set of GTIDs that have been stored persistently to file storage.
+        remote_gtid_executed: GtidExecuted
+        remote_read_errors: int
+        remote_write_errors: int
+        stream_id: int
+        updated_at: float
+        valid_local_binlog_found: bool
+
+    file_storage: BaseTransfer
+
     def __init__(
         self,
         *,
-        backup_reason,
+        backup_reason: "BackupStream.BackupReason",
         binlog_progress_tracker=None,
-        binlogs=None,
-        compression=None,
-        file_storage_setup_fn,
+        binlogs: Optional[List[BinlogInfo]] = None,
+        compression: Optional[Compression] = None,
+        file_storage_setup_fn: Callable[[], BaseTransfer],
         file_uploaded_callback=None,
-        latest_complete_binlog_index=None,
-        mode,
+        latest_complete_binlog_index: Optional[int] = None,
+        mode: "BackupStream.Mode",
         mysql_client_params,
-        mysql_config_file_name,
-        mysql_data_directory,
-        normalized_backup_time,
+        mysql_config_file_name: str,
+        mysql_data_directory: str,
+        normalized_backup_time: float,
         optimize_tables_before_backup=False,
         rsa_public_key_pem,
         remote_binlogs_state_file,
-        server_id,
+        server_id: int,
         site,
         state_file,
         stats,
-        stream_id=None,
-        temp_dir,
-    ):
+        stream_id: Optional[int] = None,
+        temp_dir: str,
+    ) -> None:
         super().__init__()
         stream_id = stream_id or self.new_stream_id()
         self.basebackup_bytes_uploaded = 0
-        self.basebackup_operation = None
-        self.basebackup_progress = None
+        self.basebackup_operation: Optional[BasebackupOperation] = None
+        self.basebackup_progress: Optional[Dict[str, Any]] = None
         self.compression = compression
         self.current_upload_index = None
         # This file storage object must only be called from BackupStream's own thread. Calls from
         # other threads must use file_storage_setup_fn to create new file storage instance
-        self.file_storage = None
         self.file_storage_setup_fn = file_storage_setup_fn
         self.file_uploaded_callback = file_uploaded_callback
         self.is_running = True
         self.iteration_sleep = BackupStream.ITERATION_SLEEP
-        self.known_remote_binlogs = set()
-        self.last_basebackup_attempt = None
+        self.last_basebackup_attempt: Optional[float] = None
         self.lock = threading.RLock()
         self.log = logging.getLogger(f"{self.__class__.__name__}/{stream_id}")
         self.mysql_client_params = mysql_client_params
@@ -134,8 +180,8 @@ class BackupStream(threading.Thread):
         self.binlog_progress_tracker = binlog_progress_tracker
         # Keep track of remote binlogs so that we can drop binlogs containing only GTID
         # ranges that have already been backed up from our list of pending binlogs
-        remote_binlogs = []
-        self.remote_binlog_manager = AppendOnlyStateManager(
+        remote_binlogs: List[RemoteBinlogInfo] = []
+        self.remote_binlog_manager = AppendOnlyStateManager[RemoteBinlogInfo](
             entries=remote_binlogs, lock=self.lock, state_file=remote_binlogs_state_file
         )
         self.remote_binlogs = remote_binlogs
@@ -151,7 +197,7 @@ class BackupStream(threading.Thread):
         active_details = {}
         if mode == self.Mode.active:
             active_details["phase"] = self.ActivePhase.basebackup
-        self.state = {
+        self.state: BackupStream.State = {
             "active_details": active_details,
             "backup_errors": 0,
             "basebackup_errors": 0,
@@ -431,7 +477,7 @@ class BackupStream(threading.Thread):
         self.state_manager.delete_state()
         self.remote_binlog_manager.delete_state()
 
-    def remove_binlogs(self, binlogs):
+    def remove_binlogs(self, binlogs: Iterable[BinlogInfo]):
         # If the stream has been closed we don't care about tracking binlogs for it anymore
         if not binlogs or self.state["closed_info"]:
             return
@@ -579,8 +625,8 @@ class BackupStream(threading.Thread):
             self.stats.increase("myhoard.remote_read_errors")
             return False
 
-    def _cache_file_metadata(self, *, missing_ok=True, remote_name, setting_name):
-        if self.state[setting_name]:
+    def _cache_file_metadata(self, *, missing_ok=True, remote_name: str, setting_name: str):
+        if self.state[setting_name]:  # type: ignore
             return True
 
         try:
@@ -596,7 +642,7 @@ class BackupStream(threading.Thread):
             self.stats.increase("myhoard.remote_read_errors")
             raise
 
-    def _cache_remote_binlogs(self, *, ignore_own_promotion):
+    def _cache_remote_binlogs(self, *, ignore_own_promotion: bool):
         next_index = self.state["next_index"] or 1
         last_index = next_index - 1
         bucket = next_index // BINLOG_BUCKET_SIZE
@@ -932,7 +978,7 @@ class BackupStream(threading.Thread):
             if not isinstance(ex, XtraBackupError):
                 self.stats.unexpected_exception(ex=ex, where="BackupStream._take_basebackup")
         finally:
-            self.basebackup_operation = None
+            del self.basebackup_operation
 
     def _upload_binlogs(self):
         while True:
