@@ -1046,22 +1046,27 @@ class BackupStream(threading.Thread):
                     )
                     self.stats.increase("myhoard.binlog.remote_copy")
                 else:
-                    with open(binlog["full_name"], "rb") as input_file:
-                        compress_stream = CompressionStream(input_file, compression_algorithm, compression_level)
-                        encrypt_stream = EncryptorStream(compress_stream, self.rsa_public_key_pem)
-                        self.file_storage.store_file_object(
-                            index_name,
-                            encrypt_stream,
-                            metadata=metadata,
-                            upload_progress_fn=self.binlog_progress_tracker.increment
-                            if self.binlog_progress_tracker
-                            else None,
-                        )
+                    try:
+                        with open(binlog["full_name"], "rb") as input_file:
+                            compress_stream = CompressionStream(input_file, compression_algorithm, compression_level)
+                            encrypt_stream = EncryptorStream(compress_stream, self.rsa_public_key_pem)
+                            self.file_storage.store_file_object(
+                                index_name,
+                                encrypt_stream,
+                                metadata=metadata,
+                                upload_progress_fn=self.binlog_progress_tracker.increment
+                                if self.binlog_progress_tracker
+                                else None,
+                            )
+                    except FileNotFoundError as e:
+                        self.log.warning("Local binlog %s did not exist", e.filename)
+                        self.stats.increase("myhoard.binlog.missing")
+                    else:
                         self.stats.increase("myhoard.binlog.upload")
-                    if self.file_uploaded_callback:
-                        self.file_uploaded_callback(
-                            local_index=binlog["local_index"], remote_key=binlog["remote_key"], stream=self
-                        )
+                        if self.file_uploaded_callback:
+                            self.file_uploaded_callback(
+                                local_index=binlog["local_index"], remote_key=binlog["remote_key"], stream=self
+                            )
                 with self.lock:
                     self.remote_binlog_manager.append(binlog)
                     self.known_remote_binlogs.add(binlog["remote_index"])
