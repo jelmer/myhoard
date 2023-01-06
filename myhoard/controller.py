@@ -369,7 +369,7 @@ class Controller(threading.Thread):
         if self.restore_coordinator:
             self.restore_coordinator.stop()
         for stream in self.backup_streams:
-            stream.stop()
+            stream.stop(reason="Controller stopping")
         if self.binlog_progress_tracker:
             self.binlog_progress_tracker.stop()
         self.log.info("Controller stopped")

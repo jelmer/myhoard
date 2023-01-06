@@ -502,13 +502,15 @@ class BackupStream(threading.Thread):
             self.state_manager.update_state(mode=self.Mode.prepare_promotion)
             self.wakeup_event.set()
 
-    def stop(self):
+    def stop(self, *, reason: str = None) -> None:
         self.log.info("Stopping backup stream")
         self.is_running = False
         self.wakeup_event.set()
+        if reason is None:
+            reason = "BackupStream stop requested"
         op = self.basebackup_operation
         if op:
-            op.abort("BackupStream stop requested")
+            op.abort(reason)
         # Thread might not have been started or could've already been joined, we don't care about that
         with suppress(Exception):
             self.join()
