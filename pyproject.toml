@@ -1,6 +1,3 @@
-[tool.black]
-line-length = 125
-
 [tool.isort]
 no_sections = true
 force_alphabetical_sort = true

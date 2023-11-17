@@ -1,5 +1,4 @@
 # Use pip for build requirements to harmonize between OS versions
-black==22.3.0
 coverage
 coveralls
 ruff
